@@ -15,7 +15,11 @@ static PARENT_DIR:&'static str = "..";
 
 #[derive(Debug)]
 enum MyError {
-    NotFound
+    NotFound,
+    FileNotFound,
+    AttrsNotFound,
+    EOF,
+    AlreadyExists,
 }
 
 impl Error for MyError {}
@@ -23,7 +27,9 @@ impl Error for MyError {}
 impl From<MyError> for c_int {
     fn from(value: MyError) -> Self {
         match value {
-            MyError::NotFound => ENOENT
+            MyError::NotFound | MyError::AttrsNotFound | MyError::FileNotFound => ENOENT,
+            MyError::EOF => EOF,
+            MyError::AlreadyExists => EEXIST,
         }
     }
 }
@@ -31,7 +37,11 @@ impl From<MyError> for c_int {
 impl std::fmt::Display for MyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MyError::NotFound => write!(f, "not found")
+            MyError::NotFound => write!(f, "not found"),
+            MyError::AttrsNotFound => write!(f, "attributes not found"),
+            MyError::FileNotFound => write!(f, "file not found"),
+            MyError::EOF => write!(f, "eof"),
+            MyError::AlreadyExists => write!(f, "already exists")
         }
     }
 }
@@ -45,6 +55,25 @@ struct Node {
 }
 
 impl Node {
+    fn new_directory(index: INode, parent: INode, name: &OsStr) -> Self{
+        Self{
+            index,
+            parent,
+            name: name.to_os_string(),
+            children: Default::default(),
+            kind: FileType::Directory,
+        }
+    }
+
+    fn new_file(index: INode, parent: INode, name: &OsStr) -> Self{
+        Self{
+            index,
+            parent,
+            name: name.to_os_string(),
+            children: Default::default(),
+            kind: FileType::RegularFile,
+        }
+    }
 }
 
 struct File {
@@ -145,6 +174,114 @@ impl NsFS {
         }
     }
 
+    fn read_file(&mut self, ino: INode, size: usize, offset: usize) -> Result<&[u8], MyError> {
+        let file = match self.files.get(&ino) {
+            Some(file) => file,
+            None => {
+                return Err(MyError::NotFound)
+            }
+        };
+
+        let attrs = match self.attrs.get_mut(&ino) {
+            Some(attrs) => attrs,
+            None => {
+                return Err(MyError::NotFound)
+            }
+        };
+        attrs.atime = SystemTime::now();
+
+        let mut size = size as usize;
+        let offset = offset as usize;
+
+        if offset >= file.data.len() {
+            return Err(MyError::EOF)
+        }
+
+        if offset + size >= file.data.len() {
+            size = file.data.len() - offset; // TODO: а может и не нужно??
+        }
+
+        Ok(&file.data[offset..offset+size])
+    }
+
+    fn write_file(&mut self, ino: INode, data: &[u8], offset: usize) -> Result<usize, MyError> {
+        let file = match self.files.get_mut(&ino) {
+            Some(file) => file,
+            None => {
+                return Err(MyError::NotFound)
+            }
+        };
+
+        let attrs = match self.attrs.get_mut(&ino) {
+            Some(attrs) => attrs,
+            None => {
+                return Err(MyError::NotFound)
+            }
+        };
+        
+
+        let offset: usize = offset as usize;
+
+        if offset >= data.len() {
+            // extend with zeroes until we are at least at offset
+            file.data.extend(std::iter::repeat(0).take(offset - file.data.len()));
+        }
+
+        if offset + data.len() > file.data.len() {
+            file.data.splice(offset.., data.iter().cloned());
+        } else {
+            file.data.splice(offset..offset + data.len(), data.iter().cloned());
+        }
+
+        let now = SystemTime::now();
+        attrs.atime = now;
+        attrs.mtime = now;
+        attrs.size = file.data.len() as u64;
+
+
+        Ok(data.len())
+    }
+
+    fn create_file(&mut self, parent: INode, name: &OsStr, flags: u32) -> Result<(&FileAttr, FileDescriptor), MyError> {
+        let ino = self.next_indoe();
+        let parent_node = match self.nodes.get_mut(&parent) {
+            Some(node) => node,
+            None => {
+                return Err(MyError::NotFound)
+            }
+        };
+
+        if parent_node.children.contains_key(name) {
+            return Err(MyError::AlreadyExists)
+        }
+
+        let ts = SystemTime::now();
+        self.attrs.insert(ino, FileAttr{
+            ino,
+            size: 0,
+            blocks: 0,
+            atime: ts,
+            mtime: ts,
+            ctime: ts,
+            crtime: ts,
+            kind: FileType::RegularFile,
+            perm: 0o777,
+            nlink: 0,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            blksize: 0,
+            flags,
+        });
+        self.files.insert(ino, File::new());
+
+        let key = name.to_os_string();
+        parent_node.children.entry(key).or_insert(Node::new_file(ino, parent, name));
+
+
+        let fh = self.open_file(ino);
+        Ok((self.attrs.get(&ino).unwrap(), fh))
+    }
 }
 
 impl Filesystem for NsFS {
@@ -241,16 +378,8 @@ impl Filesystem for NsFS {
             return;
         }
 
-        let new_node = Node{
-            index: ino,
-            parent: parent,
-            name: name.to_os_string(),
-            children: Default::default(),
-            kind: FileType::Directory,
-        };
-
         let ts = SystemTime::now();
-        self.attrs.insert(new_node.index, FileAttr{
+        self.attrs.insert(ino, FileAttr{
             ino: ino,
             size: 0,
             blocks: 0,
@@ -269,9 +398,8 @@ impl Filesystem for NsFS {
         });
 
         let key = name.to_os_string();
-        parent_node.children.insert(key, new_node);
+        parent_node.children.insert(key, Node::new_directory(ino, parent, name));
 
-        println!("mkdir end; parent: {}, name: {:?}", parent, name);
         reply.entry(&TTL, self.attrs.get(&ino).unwrap(), 0);
     }
 
@@ -343,41 +471,11 @@ impl Filesystem for NsFS {
     /// return value of the read system call will reflect the return value of this
     /// operation. fh will contain the value set by the open method, or will be undefined
     /// if the open method didn't set any value.
-    fn read(&mut self, _req: &Request<'_>, ino: u64, fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
-        let file = match self.files.get(&ino) {
-            Some(file) => file,
-            None => {
-                println!("file is not open");
-                reply.error(ENOENT);
-                return;
-            }
-        };
-
-        let attrs = match self.attrs.get_mut(&ino) {
-            Some(attrs) => attrs,
-            None => {
-                println!("can not find ino in attributes");
-                reply.error(ENOENT);
-                return;
-            }
-        };
-        attrs.atime = SystemTime::now();
-
-        let mut size = size as usize;
-        let offset = offset as usize;
-
-        if offset >= file.data.len() {
-            println!("offset > file.data.len(); {}", file.data.len());
-            reply.error(EOF);
-            return;
+    fn read(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
+        match self.read_file(ino, size as usize, offset as usize) {
+            Ok(data) => reply.data(data),
+            Err(err) => reply.error(c_int::from(err))
         }
-
-        if offset + size >= file.data.len() {
-            size = file.data.len() - offset; // TODO: а может и не нужно??
-        }
-
-        println!("read end; ino: {}, fh: {}, size: {}", ino, fh, size);
-        reply.data(&file.data[offset..offset+size]);
     }
 
     /// Write data.
@@ -386,45 +484,11 @@ impl Filesystem for NsFS {
     /// which case the return value of the write system call will reflect the return
     /// value of this operation. fh will contain the value set by the open method, or
     /// will be undefined if the open method didn't set any value.
-    fn write(&mut self, _req: &Request<'_>, ino: u64, fh: u64, offset: i64, data: &[u8], _write_flags: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyWrite) {
-        let file = match self.files.get_mut(&ino) {
-            Some(file) => file,
-            None => {
-                reply.error(ENOENT);
-                return;
-            }
-        };
-
-        let offset: usize = offset as usize;
-
-        if offset >= data.len() {
-            // extend with zeroes until we are at least at offset
-            file.data.extend(std::iter::repeat(0).take(offset - file.data.len()));
+    fn write(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, data: &[u8], _write_flags: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyWrite) {
+        match self.write_file(ino, data, offset as usize) {
+            Ok(size) => reply.written(size as u32),
+            Err(err) => reply.error(c_int::from(err))
         }
-
-        if offset + data.len() > file.data.len() {
-            file.data.splice(offset.., data.iter().cloned());
-        } else {
-            file.data.splice(offset..offset + data.len(), data.iter().cloned());
-        }
-
-
-        let attrs = match self.attrs.get_mut(&ino) {
-            Some(attrs) => attrs,
-            None => {
-                reply.error(ENOENT);
-                return;
-            }
-        };
-
-        let now = SystemTime::now();
-        attrs.atime = now;
-        attrs.mtime = now;
-        attrs.size = file.data.len() as u64;
-
-
-        println!("write end; ino: {}, fh: {}, size: {}", ino, fh, data.len());
-        reply.written(data.len() as u32);
     }
 
     /// Flush method.
@@ -571,54 +635,11 @@ impl Filesystem for NsFS {
     /// implemented or under Linux kernel versions earlier than 2.6.15, the mknod()
     /// and open() methods will be called instead.
     fn create(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, _mode: u32, _umask: u32, flags: i32, reply: ReplyCreate) {
-        let ino = self.next_indoe();
-        let parent_node = match self.nodes.get_mut(&parent) {
-            Some(node) => node,
-            None => {
-                reply.error(ENOENT);
-                return;
-            }
-        };
-
-        if parent_node.children.contains_key(name) {
-            reply.error(EEXIST);
-            return;
+        let flags = flags as u32;
+        match self.create_file(parent, name, flags) {
+            Ok((attrs, fh)) => reply.created(&TTL, attrs, 0, fh, flags),
+            Err(err) => reply.error(c_int::from(err))
         }
-
-        let new_node = Node{
-            index: ino,
-            parent: parent,
-            name: name.to_os_string(),
-            children: Default::default(),
-            kind: FileType::RegularFile,
-        };
-
-        let ts = SystemTime::now();
-        self.attrs.insert(new_node.index, FileAttr{
-            ino: ino,
-            size: 0,
-            blocks: 0,
-            atime: ts,
-            mtime: ts,
-            ctime: ts,
-            crtime: ts,
-            kind: FileType::RegularFile,
-            perm: 0o777,
-            nlink: 0,
-            uid: 0,
-            gid: 0,
-            rdev: 0,
-            blksize: 0,
-            flags: flags as u32,
-        });
-        self.files.insert(ino, File::new());
-
-        let key = name.to_os_string();
-        parent_node.children.entry(key).or_insert(new_node);
-
-        let fh = self.open_file(ino);
-
-        reply.created(&TTL, self.attrs.get(&ino).unwrap(), 0, fh, flags as u32);
     }
 
     /// Test for a POSIX file lock.
@@ -661,4 +682,3 @@ fn main() {
     let fs = NsFS::new();
     fuser::mount2(fs, &mountpoint, &[]).unwrap();
 }
- 
