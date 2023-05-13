@@ -682,3 +682,44 @@ fn main() {
     let fs = NsFS::new();
     fuser::mount2(fs, &mountpoint, &[]).unwrap();
 }
+
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::BorrowMut;
+    use super::*;
+
+
+    #[test]
+    fn test_create_file() {
+        let mut fs = NsFS::new();
+        let parent = 1;
+        let name = OsStr::new("test");
+        let flags = 0;
+        let (attrs, fh) = fs.create_file(parent, name, flags).unwrap();
+        assert_eq!(attrs.ino, 2);
+        assert_eq!(fh, 0);
+    }
+
+    #[test]
+    fn test_write_read_file() {
+        let mut fs = NsFS::new();
+        let parent = 1;
+        let name = OsStr::new("test");
+        let flags = 0;
+        let mut ino = 0;
+        {
+            let (attrs, _) = fs.borrow_mut().create_file(parent, name, flags).unwrap();
+            ino = attrs.ino;
+        }
+
+        let data = b"Hello, Rust";
+        let written = fs.write_file(ino, data, 0).unwrap();
+        assert_eq!(written, 11);
+
+        match fs.read_file(ino, 1024, 0) {
+            Ok(data) => assert_eq!(data, b"Hello, Rust"),
+            Err(err) => panic!("read_file failed: {}", err)
+        }
+    }
+}
