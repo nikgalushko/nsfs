@@ -141,7 +141,7 @@ impl NsFS {
         }
     }
 
-    fn next_indoe(&mut self) -> u64 {
+    fn next_inode(&mut self) -> u64 {
         self.current_inode += 1;
         self.current_inode
     }
@@ -170,7 +170,7 @@ impl NsFS {
     fn get_attr(&self, ino: INode) -> Result<&FileAttr, MyError> {
         match self.attrs.get(&ino) {
             Some(attrs) => Ok(attrs),
-            None => Err(MyError::NotFound)
+            None => Err(MyError::AttrsNotFound)
         }
     }
 
@@ -178,14 +178,14 @@ impl NsFS {
         let file = match self.files.get(&ino) {
             Some(file) => file,
             None => {
-                return Err(MyError::NotFound)
+                return Err(MyError::FileNotFound)
             }
         };
 
         let attrs = match self.attrs.get_mut(&ino) {
             Some(attrs) => attrs,
             None => {
-                return Err(MyError::NotFound)
+                return Err(MyError::AttrsNotFound)
             }
         };
         attrs.atime = SystemTime::now();
@@ -208,14 +208,14 @@ impl NsFS {
         let file = match self.files.get_mut(&ino) {
             Some(file) => file,
             None => {
-                return Err(MyError::NotFound)
+                return Err(MyError::FileNotFound)
             }
         };
 
         let attrs = match self.attrs.get_mut(&ino) {
             Some(attrs) => attrs,
             None => {
-                return Err(MyError::NotFound)
+                return Err(MyError::AttrsNotFound)
             }
         };
         
@@ -243,7 +243,7 @@ impl NsFS {
     }
 
     fn create_file(&mut self, parent: INode, name: &OsStr, flags: u32) -> Result<(&FileAttr, FileDescriptor), MyError> {
-        let ino = self.next_indoe();
+        let ino = self.next_inode();
         let parent_node = match self.nodes.get_mut(&parent) {
             Some(node) => node,
             None => {
@@ -319,7 +319,7 @@ impl Filesystem for NsFS {
     }
 
     /// Set file attributes.
-    fn setattr(&mut self, _req: &Request<'_>, ino: u64, _mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, size: Option<u64>, atime: Option<TimeOrNow>, mtime: Option<TimeOrNow>, ctime: Option<SystemTime>, _fh: Option<u64>, crtime: Option<SystemTime>, _chgtime: Option<SystemTime>, _bkuptime: Option<SystemTime>, _flags: Option<u32>, reply: ReplyAttr) {
+    fn setattr(&mut self, _req: &Request<'_>, ino: u64, _mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, size: Option<u64>, atime: Option<TimeOrNow>, mtime: Option<TimeOrNow>, _ctime: Option<SystemTime>, _fh: Option<u64>, crtime: Option<SystemTime>, _chgtime: Option<SystemTime>, _bkuptime: Option<SystemTime>, _flags: Option<u32>, reply: ReplyAttr) {
         let mut file = match self.attrs.get_mut(&ino) {
             Some(file) => file,
             None => {
@@ -364,7 +364,7 @@ impl Filesystem for NsFS {
 
     /// Create a directory.
     fn mkdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
-        let ino = self.next_indoe();
+        let ino = self.next_inode();
 
         let parent_node = match self.nodes.get_mut(&parent) {
             Some(node) => node,
@@ -436,17 +436,17 @@ impl Filesystem for NsFS {
     }
 
     /// Create a symbolic link.
-    fn symlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, _link: &Path, reply: ReplyEntry) {
+    fn symlink(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, _link: &Path, reply: ReplyEntry) {
         reply.error(ENOSYS);
     }
 
     /// Rename a file.
-    fn rename(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, _newparent: u64, _newname: &OsStr, _flags: u32, reply: ReplyEmpty) {
+    fn rename(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, _newparent: u64, _newname: &OsStr, _flags: u32, reply: ReplyEmpty) {
         reply.error(ENOSYS);
     }
 
     /// Create a hard link.
-    fn link(&mut self, _req: &Request<'_>, ino: u64, _newparent: u64, newname: &OsStr, reply: ReplyEntry) {
+    fn link(&mut self, _req: &Request<'_>, _ino: u64, _newparent: u64, _newname: &OsStr, reply: ReplyEntry) {
         reply.error(ENOSYS);
     }
 
@@ -562,8 +562,7 @@ impl Filesystem for NsFS {
         }
 
         ret.iter().skip(offset as usize).enumerate().for_each(|(i, entry)| {
-            println!("add to reply entry");
-            reply.add(entry.0, offset + i as i64 + 1 as i64, entry.1, &entry.2);
+            let _ = reply.add(entry.0, offset + i as i64 + 1 as i64, entry.1, &entry.2);
         });
         reply.ok();
     }
@@ -686,7 +685,6 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::BorrowMut;
     use super::*;
 
 
@@ -707,11 +705,10 @@ mod tests {
         let parent = 1;
         let name = OsStr::new("test");
         let flags = 0;
-        let mut ino = 0;
-        {
-            let (attrs, _) = fs.borrow_mut().create_file(parent, name, flags).unwrap();
-            ino = attrs.ino;
-        }
+        let ino = {
+            let (attrs, _) = fs.create_file(parent, name, flags).unwrap();
+            attrs.ino
+        };
 
         let data = b"Hello, Rust";
         let written = fs.write_file(ino, data, 0).unwrap();
