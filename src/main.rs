@@ -912,7 +912,84 @@ mod tests {
 
         match fs.read_file(ino, 1024, 0) {
             Ok(data) => assert_eq!(data, b"Hello, Rust"),
-            Err(err) => panic!("read_file failed: {}", err)
+            Err(err) => panic!("read_file failed: {}", err),
         }
+
+        match fs.get_attr(ino) {
+            Ok(attrs) => assert_eq!(attrs.size, 11),
+            Err(err) => panic!("get_attr failed: {}", err),
+        }
+    }
+
+    #[test]
+    fn test_append_to_file() {
+        let mut fs = NsFS::new();
+        let parent = 1;
+        let name = OsStr::new("test");
+        let flags = 0;
+        let ino = {
+            let (attrs, _) = fs.create_file(parent, name, flags).unwrap();
+            attrs.ino
+        };
+
+        let data = b"Hello, Rust";
+        let written = fs.write_file(ino, data, 0).unwrap();
+        assert_eq!(written, 11);
+
+        let data = b"Hello, Rust";
+        let written = fs.write_file(ino, data, 11).unwrap();
+        assert_eq!(written, 11);
+
+        match fs.read_file(ino, 1024, 0) {
+            Ok(data) => assert_eq!(data, b"Hello, RustHello, Rust"),
+            Err(err) => panic!("read_file failed: {}", err),
+        }
+
+        match fs.get_attr(ino) {
+            Ok(attrs) => assert_eq!(attrs.size, 22),
+            Err(err) => panic!("get_attr failed: {}", err),
+        }
+    }
+
+    #[test]
+    fn test_read_big_file() {
+        let mut fs = NsFS::new();
+        let parent = 1;
+        let name = OsStr::new("test");
+        let flags = 0;
+        let ino = {
+            let (attrs, _) = fs.create_file(parent, name, flags).unwrap();
+            attrs.ino
+        };
+
+        let mut offset = 0;
+        let mut expected = Vec::new();
+
+        for i in 0..100 {
+            let data = format!("#{} Hello, Rust", i);
+            expected.extend_from_slice(data.as_bytes());
+
+            let written = fs
+                .write_file(ino, &expected[offset..offset + data.len()], offset)
+                .unwrap();
+            assert_eq!(written, data.len());
+
+            offset += data.len();
+        }
+
+        match fs.get_attr(ino) {
+            Ok(attrs) => assert_eq!(attrs.size, expected.len() as u64),
+            Err(err) => panic!("get_attr failed: {}", err),
+        }
+
+        let mut data = Vec::new();
+        offset = 0;
+        while let Ok(chunk) = fs.read_file(ino, 10, offset) {
+            data.extend_from_slice(&chunk);
+            offset += chunk.len();
+        }
+
+        assert_eq!(data.len(), offset);
+        assert_eq!(data, expected);
     }
 }
