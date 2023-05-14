@@ -1,15 +1,12 @@
-use std::collections::HashMap;
-use std::error::Error;
-
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyBmap, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request,
     TimeOrNow,
 };
 
-use libc::{c_int, EEXIST, ENOENT, ENOSYS, EOF};
+use libc::{c_int, EEXIST, ENOENT, ENOSYS};
 use std::env;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -17,281 +14,299 @@ const TTL: Duration = Duration::from_secs(1);
 static CURRENT_DIR: &'static str = ".";
 static PARENT_DIR: &'static str = "..";
 
-#[derive(Debug)]
-enum MyError {
-    NotFound,
-    FileNotFound,
-    AttrsNotFound,
-    EOF,
-    AlreadyExists,
-}
+mod nsfs {
+    use fuser::{FileAttr, FileType};
+    use libc::{c_int, EEXIST, ENOENT, EOF};
+    use std::collections::HashMap;
+    use std::error::Error;
+    use std::ffi::{OsStr, OsString};
+    use std::time::SystemTime;
 
-impl Error for MyError {}
-
-impl From<MyError> for c_int {
-    fn from(value: MyError) -> Self {
-        match value {
-            MyError::NotFound | MyError::AttrsNotFound | MyError::FileNotFound => ENOENT,
-            MyError::EOF => EOF,
-            MyError::AlreadyExists => EEXIST,
-        }
+    #[derive(Debug)]
+    pub enum MyError {
+        NotFound,
+        FileNotFound,
+        AttrsNotFound,
+        EOF,
+        AlreadyExists,
     }
-}
 
-impl std::fmt::Display for MyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MyError::NotFound => write!(f, "not found"),
-            MyError::AttrsNotFound => write!(f, "attributes not found"),
-            MyError::FileNotFound => write!(f, "file not found"),
-            MyError::EOF => write!(f, "eof"),
-            MyError::AlreadyExists => write!(f, "already exists"),
-        }
-    }
-}
+    impl Error for MyError {}
 
-struct Node {
-    index: INode,
-    parent: INode,
-    name: OsString,
-    kind: FileType,
-    children: HashMap<OsString, Node>,
-}
-
-impl Node {
-    fn new_directory(index: INode, parent: INode, name: &OsStr) -> Self {
-        Self {
-            index,
-            parent,
-            name: name.to_os_string(),
-            children: Default::default(),
-            kind: FileType::Directory,
+    impl From<MyError> for c_int {
+        fn from(value: MyError) -> Self {
+            match value {
+                MyError::NotFound | MyError::AttrsNotFound | MyError::FileNotFound => ENOENT,
+                MyError::EOF => EOF,
+                MyError::AlreadyExists => EEXIST,
+            }
         }
     }
 
-    fn new_file(index: INode, parent: INode, name: &OsStr) -> Self {
-        Self {
-            index,
-            parent,
-            name: name.to_os_string(),
-            children: Default::default(),
-            kind: FileType::RegularFile,
+    impl std::fmt::Display for MyError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                MyError::NotFound => write!(f, "not found"),
+                MyError::AttrsNotFound => write!(f, "attributes not found"),
+                MyError::FileNotFound => write!(f, "file not found"),
+                MyError::EOF => write!(f, "eof"),
+                MyError::AlreadyExists => write!(f, "already exists"),
+            }
         }
     }
-}
 
-struct File {
-    data: Vec<u8>,
-}
-
-impl File {
-    fn new() -> Self {
-        Self { data: Vec::new() }
+    pub(crate) struct Node {
+        pub(crate) index: INode,
+        pub(crate) parent: INode,
+        pub(crate) name: OsString,
+        pub(crate) kind: FileType,
+        pub(crate) children: HashMap<OsString, Node>,
     }
-}
 
-type FileDescriptor = u64;
-type INode = u64;
-
-struct NsFS {
-    attrs: HashMap<INode, FileAttr>,
-    nodes: HashMap<INode, Node>,
-    open_files: HashMap<FileDescriptor, INode>,
-    files: HashMap<INode, File>,
-    current_inode: u64,
-    current_file_descriptor: FileDescriptor,
-}
-
-impl NsFS {
-    fn new() -> Self {
-        let root = Node {
-            index: 1,
-            parent: 0,
-            name: OsString::from("/"),
-            children: Default::default(),
-            kind: FileType::Directory,
-        };
-
-        let now = SystemTime::now();
-        let mut attrs: HashMap<u64, FileAttr> = Default::default();
-        attrs.insert(
-            1,
-            FileAttr {
-                ino: 1,
-                size: 0,
-                blocks: 0,
-                atime: now,
-                mtime: now,
-                ctime: now,
-                crtime: now,
+    impl Node {
+        pub(crate) fn new_directory(index: INode, parent: INode, name: &OsStr) -> Self {
+            Self {
+                index,
+                parent,
+                name: name.to_os_string(),
+                children: Default::default(),
                 kind: FileType::Directory,
-                perm: 0,
-                nlink: 0,
-                uid: 0,
-                gid: 0,
-                rdev: 0,
-                blksize: 0,
-                flags: 0,
-            },
-        );
-
-        let mut nodes: HashMap<u64, Node> = Default::default();
-        nodes.insert(1, root);
-
-        Self {
-            attrs,
-            nodes,
-            current_inode: 1, // 1 is root TODO: add root to attrs
-            open_files: Default::default(),
-            files: Default::default(),
-            current_file_descriptor: 0,
-        }
-    }
-
-    fn next_inode(&mut self) -> u64 {
-        self.current_inode += 1;
-        self.current_inode
-    }
-
-    fn open_file(&mut self, ino: INode) -> FileDescriptor {
-        let fd = self.current_file_descriptor;
-        self.current_file_descriptor += 1;
-        self.open_files.insert(fd, ino);
-        fd
-    }
-
-    fn find_node(&self, parent: INode, name: &OsStr) -> Result<&Node, MyError> {
-        let parent = match self.nodes.get(&parent) {
-            Some(node) => node,
-            None => return Err(MyError::NotFound),
-        };
-
-        let node = match parent.children.get(name) {
-            Some(node) => node,
-            None => return Err(MyError::NotFound),
-        };
-
-        return Ok(node);
-    }
-
-    fn get_attr(&self, ino: INode) -> Result<&FileAttr, MyError> {
-        match self.attrs.get(&ino) {
-            Some(attrs) => Ok(attrs),
-            None => Err(MyError::AttrsNotFound),
-        }
-    }
-
-    fn read_file(&mut self, ino: INode, size: usize, offset: usize) -> Result<&[u8], MyError> {
-        let file = match self.files.get(&ino) {
-            Some(file) => file,
-            None => return Err(MyError::FileNotFound),
-        };
-
-        let attrs = match self.attrs.get_mut(&ino) {
-            Some(attrs) => attrs,
-            None => return Err(MyError::AttrsNotFound),
-        };
-        attrs.atime = SystemTime::now();
-
-        let mut size = size as usize;
-        let offset = offset as usize;
-
-        if offset >= file.data.len() {
-            return Err(MyError::EOF);
+            }
         }
 
-        if offset + size >= file.data.len() {
-            size = file.data.len() - offset; // TODO: а может и не нужно??
-        }
-
-        Ok(&file.data[offset..offset + size])
-    }
-
-    fn write_file(&mut self, ino: INode, data: &[u8], offset: usize) -> Result<usize, MyError> {
-        let file = match self.files.get_mut(&ino) {
-            Some(file) => file,
-            None => return Err(MyError::FileNotFound),
-        };
-
-        let attrs = match self.attrs.get_mut(&ino) {
-            Some(attrs) => attrs,
-            None => return Err(MyError::AttrsNotFound),
-        };
-
-        let offset: usize = offset as usize;
-
-        if offset >= data.len() {
-            // extend with zeroes until we are at least at offset
-            file.data
-                .extend(std::iter::repeat(0).take(offset - file.data.len()));
-        }
-
-        if offset + data.len() > file.data.len() {
-            file.data.splice(offset.., data.iter().cloned());
-        } else {
-            file.data
-                .splice(offset..offset + data.len(), data.iter().cloned());
-        }
-
-        let now = SystemTime::now();
-        attrs.atime = now;
-        attrs.mtime = now;
-        attrs.size = file.data.len() as u64;
-
-        Ok(data.len())
-    }
-
-    fn create_file(
-        &mut self,
-        parent: INode,
-        name: &OsStr,
-        flags: u32,
-    ) -> Result<(&FileAttr, FileDescriptor), MyError> {
-        let ino = self.next_inode();
-        let parent_node = match self.nodes.get_mut(&parent) {
-            Some(node) => node,
-            None => return Err(MyError::NotFound),
-        };
-
-        if parent_node.children.contains_key(name) {
-            return Err(MyError::AlreadyExists);
-        }
-
-        let ts = SystemTime::now();
-        self.attrs.insert(
-            ino,
-            FileAttr {
-                ino,
-                size: 0,
-                blocks: 0,
-                atime: ts,
-                mtime: ts,
-                ctime: ts,
-                crtime: ts,
+        fn new_file(index: INode, parent: INode, name: &OsStr) -> Self {
+            Self {
+                index,
+                parent,
+                name: name.to_os_string(),
+                children: Default::default(),
                 kind: FileType::RegularFile,
-                perm: 0o777,
-                nlink: 0,
-                uid: 0,
-                gid: 0,
-                rdev: 0,
-                blksize: 0,
-                flags,
-            },
-        );
-        self.files.insert(ino, File::new());
+            }
+        }
+    }
 
-        let key = name.to_os_string();
-        parent_node
-            .children
-            .entry(key)
-            .or_insert(Node::new_file(ino, parent, name));
+    struct File {
+        data: Vec<u8>,
+    }
 
-        let fh = self.open_file(ino);
-        Ok((self.attrs.get(&ino).unwrap(), fh))
+    impl File {
+        fn new() -> Self {
+            Self { data: Vec::new() }
+        }
+    }
+
+    type FileDescriptor = u64;
+    type INode = u64;
+    pub(crate) struct NsFS {
+        pub(crate) attrs: HashMap<INode, FileAttr>,
+        pub(crate) nodes: HashMap<INode, Node>,
+        pub(crate) open_files: HashMap<FileDescriptor, INode>,
+        files: HashMap<INode, File>,
+        current_inode: u64,
+        current_file_descriptor: FileDescriptor,
+    }
+
+    impl NsFS {
+        pub(crate) fn new() -> Self {
+            let root = Node {
+                index: 1,
+                parent: 0,
+                name: OsString::from("/"),
+                children: Default::default(),
+                kind: FileType::Directory,
+            };
+
+            let now = SystemTime::now();
+            let mut attrs: HashMap<u64, FileAttr> = Default::default();
+            attrs.insert(
+                1,
+                FileAttr {
+                    ino: 1,
+                    size: 0,
+                    blocks: 0,
+                    atime: now,
+                    mtime: now,
+                    ctime: now,
+                    crtime: now,
+                    kind: FileType::Directory,
+                    perm: 0,
+                    nlink: 0,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                    blksize: 0,
+                    flags: 0,
+                },
+            );
+
+            let mut nodes: HashMap<u64, Node> = Default::default();
+            nodes.insert(1, root);
+
+            Self {
+                attrs,
+                nodes,
+                current_inode: 1, // 1 is root TODO: add root to attrs
+                open_files: Default::default(),
+                files: Default::default(),
+                current_file_descriptor: 0,
+            }
+        }
+
+        pub(crate) fn next_inode(&mut self) -> u64 {
+            self.current_inode += 1;
+            self.current_inode
+        }
+
+        pub(crate) fn open_file(&mut self, ino: INode) -> FileDescriptor {
+            let fd = self.current_file_descriptor;
+            self.current_file_descriptor += 1;
+            self.open_files.insert(fd, ino);
+            fd
+        }
+
+        pub(crate) fn find_node(&self, parent: INode, name: &OsStr) -> Result<&Node, MyError> {
+            let parent = match self.nodes.get(&parent) {
+                Some(node) => node,
+                None => return Err(MyError::NotFound),
+            };
+
+            let node = match parent.children.get(name) {
+                Some(node) => node,
+                None => return Err(MyError::NotFound),
+            };
+
+            return Ok(node);
+        }
+
+        pub(crate) fn get_attr(&self, ino: INode) -> Result<&FileAttr, MyError> {
+            match self.attrs.get(&ino) {
+                Some(attrs) => Ok(attrs),
+                None => Err(MyError::AttrsNotFound),
+            }
+        }
+
+        pub(crate) fn read_file(
+            &mut self,
+            ino: INode,
+            size: usize,
+            offset: usize,
+        ) -> Result<&[u8], MyError> {
+            let file = match self.files.get(&ino) {
+                Some(file) => file,
+                None => return Err(MyError::FileNotFound),
+            };
+
+            let attrs = match self.attrs.get_mut(&ino) {
+                Some(attrs) => attrs,
+                None => return Err(MyError::AttrsNotFound),
+            };
+            attrs.atime = SystemTime::now();
+
+            let mut size = size as usize;
+            let offset = offset as usize;
+
+            if offset >= file.data.len() {
+                return Err(MyError::EOF);
+            }
+
+            if offset + size >= file.data.len() {
+                size = file.data.len() - offset; // TODO: а может и не нужно??
+            }
+
+            Ok(&file.data[offset..offset + size])
+        }
+
+        pub(crate) fn write_file(
+            &mut self,
+            ino: INode,
+            data: &[u8],
+            offset: usize,
+        ) -> Result<usize, MyError> {
+            let file = match self.files.get_mut(&ino) {
+                Some(file) => file,
+                None => return Err(MyError::FileNotFound),
+            };
+
+            let attrs = match self.attrs.get_mut(&ino) {
+                Some(attrs) => attrs,
+                None => return Err(MyError::AttrsNotFound),
+            };
+
+            let offset: usize = offset as usize;
+
+            if offset >= data.len() {
+                // extend with zeroes until we are at least at offset
+                file.data
+                    .extend(std::iter::repeat(0).take(offset - file.data.len()));
+            }
+
+            if offset + data.len() > file.data.len() {
+                file.data.splice(offset.., data.iter().cloned());
+            } else {
+                file.data
+                    .splice(offset..offset + data.len(), data.iter().cloned());
+            }
+
+            let now = SystemTime::now();
+            attrs.atime = now;
+            attrs.mtime = now;
+            attrs.size = file.data.len() as u64;
+
+            Ok(data.len())
+        }
+
+        pub(crate) fn create_file(
+            &mut self,
+            parent: INode,
+            name: &OsStr,
+            flags: u32,
+        ) -> Result<(&FileAttr, FileDescriptor), MyError> {
+            let ino = self.next_inode();
+            let parent_node = match self.nodes.get_mut(&parent) {
+                Some(node) => node,
+                None => return Err(MyError::NotFound),
+            };
+
+            if parent_node.children.contains_key(name) {
+                return Err(MyError::AlreadyExists);
+            }
+
+            let ts = SystemTime::now();
+            self.attrs.insert(
+                ino,
+                FileAttr {
+                    ino,
+                    size: 0,
+                    blocks: 0,
+                    atime: ts,
+                    mtime: ts,
+                    ctime: ts,
+                    crtime: ts,
+                    kind: FileType::RegularFile,
+                    perm: 0o777,
+                    nlink: 0,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                    blksize: 0,
+                    flags,
+                },
+            );
+            self.files.insert(ino, File::new());
+
+            let key = name.to_os_string();
+            parent_node
+                .children
+                .entry(key)
+                .or_insert(Node::new_file(ino, parent, name));
+
+            let fh = self.open_file(ino);
+            Ok((self.attrs.get(&ino).unwrap(), fh))
+        }
     }
 }
 
-impl Filesystem for NsFS {
+impl Filesystem for nsfs::NsFS {
     /// Look up a directory entry by name and get its attributes.
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let node = match self.find_node(parent, name) {
@@ -450,7 +465,7 @@ impl Filesystem for NsFS {
         let key = name.to_os_string();
         parent_node
             .children
-            .insert(key, Node::new_directory(ino, parent, name));
+            .insert(key, nsfs::Node::new_directory(ino, parent, name));
 
         reply.entry(&TTL, self.attrs.get(&ino).unwrap(), 0);
     }
@@ -876,7 +891,7 @@ fn main() {
 
     let mountpoint = &args[1];
 
-    let fs = NsFS::new();
+    let fs = nsfs::NsFS::new();
     fuser::mount2(fs, &mountpoint, &[]).unwrap();
 }
 
@@ -886,7 +901,7 @@ mod tests {
 
     #[test]
     fn test_create_file() {
-        let mut fs = NsFS::new();
+        let mut fs = nsfs::NsFS::new();
         let parent = 1;
         let name = OsStr::new("test");
         let flags = 0;
@@ -897,7 +912,7 @@ mod tests {
 
     #[test]
     fn test_write_read_file() {
-        let mut fs = NsFS::new();
+        let mut fs = nsfs::NsFS::new();
         let parent = 1;
         let name = OsStr::new("test");
         let flags = 0;
@@ -923,7 +938,7 @@ mod tests {
 
     #[test]
     fn test_append_to_file() {
-        let mut fs = NsFS::new();
+        let mut fs = nsfs::NsFS::new();
         let parent = 1;
         let name = OsStr::new("test");
         let flags = 0;
@@ -953,7 +968,7 @@ mod tests {
 
     #[test]
     fn test_read_big_file() {
-        let mut fs = NsFS::new();
+        let mut fs = nsfs::NsFS::new();
         let parent = 1;
         let name = OsStr::new("test");
         let flags = 0;
